@@ -1,39 +1,60 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the "Software"),
-// to deal in the Software without restriction, including without limitation
-// the rights to use, copy, modify, merge, publish, distribute, sublicense,
-// and/or sell copies of the Software, and to permit persons to whom the
-// Software is furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-// DEALINGS IN THE SOFTWARE.
-use std::{
-    collections::hash_map::DefaultHasher,
-    error::Error,
-    hash::{Hash, Hasher},
-    time::Duration,
-};
+#![feature(slice_as_array)]
 
-use futures::stream::StreamExt;
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+use futures::StreamExt;
 use libp2p::{
     gossipsub, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
+use std::time::Duration;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
 
-// We create a custom network behaviour that combines Gossipsub and Mdns.
+pub struct Block {
+    data: Vec<u8>,
+    nonce: Vec<u8>,
+}
+
+pub fn encrypt(data: &[u8], password: &str) -> Block {
+    let hash = Sha256::digest(password.as_bytes());
+    let password_byte = hash.as_array().unwrap();
+    let key: &Key<Aes256Gcm> = password_byte.into();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+
+    let encrypted_data = match cipher.encrypt(&nonce, data) {
+        Ok(encrypted) => Block {
+            data: encrypted,
+            nonce: nonce.to_vec(),
+        },
+        Err(_) => panic!("could not encrypt"),
+    };
+
+    encrypted_data
+}
+
+pub fn decrypt(encrypted_text: &Block, password: &str) -> Vec<u8> {
+    let hash = Sha256::digest(password.as_bytes());
+    let password_byte = hash.as_array().unwrap();
+    let key: &Key<Aes256Gcm> = password_byte.into();
+    let nonce = Nonce::from_slice(&encrypted_text.nonce);
+    let cipher = Aes256Gcm::new(&key);
+
+    cipher
+        .decrypt(nonce, encrypted_text.data.as_slice())
+        .unwrap_or_else(|_| {
+            println!("Failed to decrypt");
+            vec![]
+        })
+}
+
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
@@ -55,23 +76,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?
         .with_quic()
         .with_behaviour(|key| {
-            // To content-address message, we can take the hash of message and use it as an ID.
             let message_id_fn = |message: &gossipsub::Message| {
                 let mut s = DefaultHasher::new();
                 message.data.hash(&mut s);
                 gossipsub::MessageId::from(s.finish().to_string())
             };
 
-            // Set a custom gossipsub configuration
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
-                // signing)
-                .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .message_id_fn(message_id_fn)
                 .build()
-                .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
+                .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
 
-            // build a gossipsub network behaviour
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
@@ -83,27 +100,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })?
         .build();
 
-    // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("test-net");
-    // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-    // Read full lines from stdin
     let mut stdin = io::BufReader::new(io::stdin()).lines();
-
-    // Listen on all interfaces and whatever port the OS assigns
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    // swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
+
+    println!("Enter the password to use for AES-GCM encryption:");
+    let password = stdin.next_line().await?.unwrap();
 
     println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
 
-    // Kick it off
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
+                let encrypted_block = encrypt(line.as_bytes(), &password);
+
+                let mut message = encrypted_block.nonce.clone();
+                message.extend_from_slice(&encrypted_block.data);
+
                 if let Err(e) = swarm
                     .behaviour_mut().gossipsub
-                    .publish(topic.clone(), line.as_bytes()) {
+                    .publish(topic.clone(), &*message) {
                     println!("Publish error: {e:?}");
                 }
             }
@@ -124,10 +143,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     propagation_source: peer_id,
                     message_id: id,
                     message,
-                })) => println!(
-                        "Got message: '{}' with id: {id} from peer: {peer_id}",
-                        String::from_utf8_lossy(&message.data),
-                    ),
+                })) => {
+                    let (nonce, ciphertext) = message.data.split_at(12);
+                    let encrypted_block = Block {
+                        data: ciphertext.to_vec(),
+                        nonce: nonce.to_vec(),
+                    };
+
+                    let plaintext = decrypt(&encrypted_block, &password);
+                    if !plaintext.is_empty(){
+                         println!(
+                            "Got message: '{}' with id: {id} from peer: {peer_id}",
+                            String::from_utf8_lossy(&plaintext),
+                        );
+                    }
+                },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("Local node is listening on {address}");
                 }
