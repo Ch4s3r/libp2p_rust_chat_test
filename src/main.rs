@@ -99,13 +99,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(MyBehaviour { gossipsub, mdns })
         })?
         .build();
-
-    let topic = gossipsub::IdentTopic::new("test-net");
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+    println!("Enter the topic you want to join:");
+    let topic_name = stdin.next_line().await?.unwrap();
+    let topic = gossipsub::IdentTopic::new(topic_name);
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    // swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
+    swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
 
     println!("Enter the password to use for AES-GCM encryption:");
     let password = stdin.next_line().await?.unwrap();
